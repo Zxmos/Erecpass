@@ -1,0 +1,330 @@
+name: Build ERecPass Android APK
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "index.html"
+      - "*.js"
+      - "admin-login-apk-fix.js"
+      - "*.css"
+      - "*.png"
+      - "*.jpg"
+      - "*.jpeg"
+      - "*.svg"
+      - "*.webp"
+      - "assets/**"
+      - "google-services.json"
+      - "push-notifications-bridge.js"
+      - "push-notifications-runtime.js"
+      - "supabase/migrations/**"
+      - "supabase/functions/erecpass-push-notification/**"
+      - ".github/workflows/build-android-apk.yml"
+      - ".github/workflows/build-android-release.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout ERecPass
+        uses: actions/checkout@v4
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
+          accept-android-sdk-licenses: true
+      - name: Install Android build packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager "platforms;android-35" "build-tools;35.0.0"
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Prepare web assets and Capacitor project
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p www
+          rsync -av ./ www/ --exclude '.git/' --exclude '.github/' --exclude 'www/' --exclude 'android/' --exclude 'node_modules/' --exclude 'package-lock.json' --exclude 'package.json' --exclude 'google-services.json'
+          npm init -y
+          npm install @capacitor/core@^6 @capacitor/android@^6 @supabase/supabase-js@^2 qrcodejs html5-qrcode @capacitor/local-notifications@^6 @capacitor/push-notifications@^6
+          npm install --save-dev @capacitor/cli@^6 esbuild
+          # Bundle Supabase locally for Android WebView so Admin login does not
+          # depend on loading the Supabase SDK from a third-party CDN at runtime.
+          mkdir -p www/vendor
+          npx esbuild @supabase/supabase-js --bundle --format=iife --global-name=supabase --outfile=www/vendor/supabase.js
+          # Explicitly bundle the Capacitor Local Notifications JavaScript proxy.
+          # Installing the native package alone does not expose its JS API to plain HTML scripts.
+          npx esbuild local-notifications-bridge.js --bundle --format=iife --outfile=www/vendor/local-notifications.js
+          # Bundle Capacitor Push Notifications as a native-only enhancement. Web behavior remains unchanged.
+          npx esbuild push-notifications-bridge.js --bundle --format=iife --outfile=www/vendor/push-notifications.js
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("www/index.html")
+          s = p.read_text()
+          target = '<script src="./medication-reminders.js"></script>'
+          tags = [
+              '<script src="./vendor/local-notifications.js"></script>',
+              '<script src="./vendor/push-notifications.js"></script>',
+              '<script src="./push-notifications-runtime.js"></script>'
+          ]
+          if s.count(target) != 1:
+              raise SystemExit("Could not locate the medication reminders script tag exactly once")
+          for tag in tags:
+              if tag not in s:
+                  s = s.replace(target, tag + chr(10) + target, 1)
+          p.write_text(s)
+          PY
+          # Package QR generation and camera-scanner libraries locally so the APK
+          # does not rely on public CDNs for these core patient/staff functions.
+          python3 - <<'PY'
+          from pathlib import Path
+          import shutil
+
+          vendor = Path("www/vendor")
+          vendor.mkdir(parents=True, exist_ok=True)
+          packages = [
+              (Path("node_modules/qrcodejs"), "qrcode.min.js", vendor / "qrcode.min.js"),
+              (Path("node_modules/html5-qrcode"), "html5-qrcode.min.js", vendor / "html5-qrcode.min.js"),
+          ]
+          for root, filename, destination in packages:
+              matches = list(root.rglob(filename)) if root.exists() else []
+              if not matches:
+                  raise SystemExit(f"Missing {filename} in installed package {root}")
+              # Prefer a root-level distribution if the package contains duplicates.
+              matches.sort(key=lambda p: (len(p.parts), str(p)))
+              shutil.copy2(matches[0], destination)
+              if not destination.is_file() or destination.stat().st_size < 1000:
+                  raise SystemExit(f"Bundled library is missing or unexpectedly small: {destination}")
+              print(f"Bundled {matches[0]} -> {destination}")
+          PY
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          p = Path("www/index.html")
+          s = p.read_text()
+          replacements = [
+              (r'<script\s+src=["\']https://cdn\.jsdelivr\.net/npm/@supabase/supabase-js@2["\']\s*></script>', '<script src="./vendor/supabase.js"></script>', "Supabase SDK"),
+              (r'<script\s+src=["\']https://cdnjs\.cloudflare\.com/ajax/libs/qrcodejs/1\.0\.0/qrcode\.min\.js["\']\s*></script>', '<script src="./vendor/qrcode.min.js"></script>', "QR generator"),
+              (r'<script\s+src=["\']https://unpkg\.com/html5-qrcode["\']\s*></script>', '<script src="./vendor/html5-qrcode.min.js"></script>', "QR scanner"),
+          ]
+          for pattern, replacement, label in replacements:
+              s, count = re.subn(pattern, lambda _m: replacement, s, count=1)
+              if count != 1:
+                  raise SystemExit(f"Could not replace expected {label} CDN script tag in packaged index.html")
+          p.write_text(s)
+          PY
+          cat > capacitor.config.json <<'EOF'
+          {
+            "appId": "com.erecpass.hospital",
+            "appName": "ERecPass",
+            "webDir": "www",
+            "server": { "androidScheme": "https" }
+          }
+          EOF
+          npx cap add android
+          # Firebase config must match the existing APK applicationId; fail closed if it does not.
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          import re
+          cfg = Path("google-services.json")
+          if not cfg.is_file():
+              raise SystemExit("Missing root google-services.json; download the Firebase config for com.erecpass.hospital")
+          data = json.loads(cfg.read_text())
+          clients = data.get("client", [])
+          if not any(c.get("client_info", {}).get("android_client_info", {}).get("package_name") == "com.erecpass.hospital" for c in clients):
+              raise SystemExit("Firebase google-services.json package_name must be com.erecpass.hospital")
+          Path("android/app/google-services.json").write_text(cfg.read_text())
+          root = Path("android/build.gradle")
+          gradle = root.read_text()
+          plugin = "classpath 'com.google.gms:google-services:4.4.2'"
+          if plugin not in gradle:
+              needle = "dependencies {"
+              pos = gradle.find(needle)
+              if pos < 0 or "buildscript {" not in gradle[:pos]:
+                  raise SystemExit("Could not locate buildscript dependencies in android/build.gradle")
+              insert_at = pos + len(needle)
+              gradle = gradle[:insert_at] + chr(10) + "        " + plugin + gradle[insert_at:]
+              root.write_text(gradle)
+              root.write_text(gradle)
+          app = Path("android/app/build.gradle")
+          app_gradle = app.read_text()
+          app_plugin = "apply plugin: 'com.google.gms.google-services'"
+          if app_plugin not in app_gradle:
+              app.write_text(app_gradle.rstrip() + chr(10) + chr(10) + app_plugin + chr(10))
+          print("Firebase Android config verified and Google Services Gradle plugin configured.")
+          PY
+          # Ensure Android declares camera access for the in-app QR scanner.
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          p = Path("android/app/src/main/AndroidManifest.xml")
+          s = p.read_text()
+          permissions = [
+              '<uses-permission android:name="android.permission.CAMERA" />',
+              '<uses-permission android:name="android.permission.POST_NOTIFICATIONS" />',
+              '<uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />',
+              '<uses-permission android:name="android.permission.VIBRATE" />',
+          ]
+          missing = [permission for permission in permissions if permission not in s]
+          if missing:
+              match = re.search(r'<manifest\b[^>]*>', s)
+              if not match:
+                  raise SystemExit("Could not locate manifest root to add Android permissions")
+              s = s[:match.end()] + "\n    " + "\n    ".join(missing) + s[match.end():]
+              p.write_text(s)
+          PY
+          # Add a small native bridge so the installed APK can save patient QR PNGs
+          # directly to the public Downloads folder on Android 10+.
+          mkdir -p android/app/src/main/java/com/erecpass/hospital
+          cat > android/app/src/main/java/com/erecpass/hospital/MainActivity.java <<'JAVA'
+          package com.erecpass.hospital;
+
+          import android.content.ContentValues;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.os.Environment;
+          import android.provider.MediaStore;
+          import android.util.Base64;
+          import android.webkit.JavascriptInterface;
+          import java.io.OutputStream;
+          import com.getcapacitor.BridgeActivity;
+
+          public class MainActivity extends BridgeActivity {
+            @Override
+            public void onCreate(Bundle savedInstanceState) {
+              super.onCreate(savedInstanceState);
+              if (bridge != null && bridge.getWebView() != null) {
+                bridge.getWebView().addJavascriptInterface(new PatientQrDownloader(), "ERecPassNative");
+                // WebView exposes newly added JavascriptInterface objects on the next page load.
+                // Reload only on a fresh Activity launch so the QR download bridge is available
+                // before the user taps Download / Save QR.
+                if (savedInstanceState == null) {
+                  bridge.getWebView().post(() -> bridge.getWebView().reload());
+                }
+              }
+            }
+
+            private class PatientQrDownloader {
+              @JavascriptInterface
+              public String savePng(String base64Png, String requestedName) {
+                if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+                  return "ERROR: Direct Downloads saving requires Android 10 or newer.";
+                }
+                Uri uri = null;
+                try {
+                  String safeName = requestedName == null ? "ERecPass-Patient-QR.png"
+                    : requestedName.replaceAll("[^a-zA-Z0-9._-]", "_");
+                  ContentValues values = new ContentValues();
+                  values.put(MediaStore.Downloads.DISPLAY_NAME, safeName);
+                  values.put(MediaStore.Downloads.MIME_TYPE, "image/png");
+                  values.put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/ERecPass");
+                  values.put(MediaStore.Downloads.IS_PENDING, 1);
+                  uri = getContentResolver().insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values);
+                  if (uri == null) return "ERROR: Android could not create the Downloads file.";
+                  byte[] bytes = Base64.decode(base64Png, Base64.DEFAULT);
+                  try (OutputStream out = getContentResolver().openOutputStream(uri)) {
+                    if (out == null) throw new IllegalStateException("Could not open Downloads file");
+                    out.write(bytes);
+                    out.flush();
+                  }
+                  ContentValues complete = new ContentValues();
+                  complete.put(MediaStore.Downloads.IS_PENDING, 0);
+                  getContentResolver().update(uri, complete, null, null);
+                  return "OK:" + uri.toString();
+                } catch (Exception e) {
+                  if (uri != null) {
+                    try { getContentResolver().delete(uri, null, null); } catch (Exception ignored) {}
+                  }
+                  return "ERROR:" + e.getMessage();
+                }
+              }
+            }
+          }
+          JAVA
+          npx cap sync android
+          # Create a short, gentle reminder tone for Android notification channels.
+          python3 - <<'PY'
+          from pathlib import Path
+          import math
+          import struct
+          import wave
+
+          out = Path("android/app/src/main/res/raw/erecpass_reminder.wav")
+          out.parent.mkdir(parents=True, exist_ok=True)
+          rate = 44100
+          samples = []
+          duration = 0.95
+          for i in range(int(rate * duration)):
+              t = i / rate
+              active = (0.04 <= t < 0.30) or (0.42 <= t < 0.72)
+              if active:
+                  local = (t - 0.04) if t < 0.30 else (t - 0.42)
+                  fade = min(1.0, local / 0.015, (0.26 - local) / 0.04)
+                  value = int(9000 * max(0.0, fade) * math.sin(2 * math.pi * 880 * t))
+              else:
+                  value = 0
+              samples.append(struct.pack("<h", value))
+          with wave.open(str(out), "wb") as wav:
+              wav.setnchannels(1)
+              wav.setsampwidth(2)
+              wav.setframerate(rate)
+              wav.writeframes(b"".join(samples))
+          if not out.is_file() or out.stat().st_size < 1000:
+              raise SystemExit("Could not create the ERecPass reminder sound")
+          print(f"Created notification sound: {out} ({out.stat().st_size} bytes)")
+          PY
+      - name: Apply ERecPass launcher icon
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y imagemagick
+          ICON="assets/erecpass-app-icon.svg"
+          test -s "$ICON"
+          RES="android/app/src/main/res"
+          for spec in "mdpi:48" "hdpi:72" "xhdpi:96" "xxhdpi:144" "xxxhdpi:192"; do
+            density="${spec%%:*}"
+            size="${spec##*:}"
+            mkdir -p "$RES/mipmap-$density"
+            convert -background none "$ICON" -resize "${size}x${size}" "$RES/mipmap-$density/ic_launcher.png"
+            convert -background none "$ICON" -resize "${size}x${size}" "$RES/mipmap-$density/ic_launcher_foreground.png"
+          done
+          mkdir -p "$RES/drawable"
+          convert -background none "$ICON" -resize 432x432 "$RES/drawable/ic_launcher_foreground.png"
+      - name: Build debug APK
+        run: |
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleDebug
+      - name: Verify APK signature and Android compatibility
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK="android/app/build/outputs/apk/debug/app-debug.apk"
+          test -s "$APK"
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$APK"
+          "$ANDROID_HOME/build-tools/35.0.0/aapt" dump badging "$APK" | tee /tmp/erecpass-apk-badging.txt
+          grep -q "package: name='com.erecpass.hospital'" /tmp/erecpass-apk-badging.txt
+          grep -q "sdkVersion:'22'" /tmp/erecpass-apk-badging.txt
+          sha256sum "$APK"
+          unzip -t "$APK" | tail -n 2
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ERecPass-Android-APK
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14

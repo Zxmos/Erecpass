@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "330021941272",
+    "project_id": "comerecpasshospital",
+    "storage_bucket": "comerecpasshospital.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:330021941272:android:b33243425e08dd1ed5136d",
+        "android_client_info": {
+          "package_name": "com.erecpass.hospital"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyAV7aBg-o0xsCb5c0wr5lj43csKI2ygfcY"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

@@ -29,7 +29,7 @@ If a reset link shows a 404, make sure the GitHub Pages URL is registered in Sup
 - Foreign-key indexes were added for common account/audit relationships.
 - Duplicate legacy-id indexes were removed.
 - Staff availability RLS was optimized to evaluate `auth.uid()` once per statement.
-- The Admin email bootstrap trigger is aligned to `admin2@gmail.com`.
+- The Admin email bootstrap trigger is aligned to the configured administrator account.
 - New Auth users are assigned a patient row only when the resulting profile role is actually `patient`, preventing Admin/Staff accounts from accidentally receiving patient records.
 
 ## Important
